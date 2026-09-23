@@ -6,8 +6,13 @@ For A, every one of B's turns is interleaved traffic, and vice versa. Each turn
 is its own request, which is what an agentic loop does.
 
 The pass criterion is not "a high hit rate" but "this turn reused the whole
-prefix the previous turn established": ``cached_tokens >= 0.9 * prev_prompt``.
-Failure is reported as PREFIX-LOST and means the turn re-prefilled in full.
+prefix the previous turn established". A hybrid model never serves back the block
+holding the previous request's end (#102), so a healthy turn reuses
+``max(0, prev_prompt // B - 1) * B`` tokens, B being the engine's hybrid attention
+block, read from ``vllm:cache_config_info`` on /metrics. A turn below that is
+PREFIX-LOST. If the block cannot be read, the fallback is 90% of the previous
+prompt, which misreads short conversations: with B = 2176 a healthy turn under
+~44K tokens is below 90%.
 
 Regimes are sharp, so read the size table in the issue rather than one run:
 
@@ -21,6 +26,7 @@ Usage:
     HQ_UNIT=qwen38-hq-vllm python bench/prefix_alternation.py    # engine-env label
 """
 import argparse
+import re
 import datetime as dt
 import json
 import os
@@ -42,9 +48,40 @@ def _key(path):  # same convention as quality_battery.py
 KEY = os.environ.get("VLLM_API_KEY") or _key(os.path.join(HERE, "..", "api_key.txt"))
 API = os.environ.get("VLLM_API", "http://127.0.0.1:18020/v1")
 MODEL = os.environ.get("VLLM_MODEL", "qwen3.8-27b")
-UNIT = os.environ.get("HQ_UNIT", "qwen38-hq-vllm")
+UNIT = os.environ.get("HQ_UNIT", "")
 
 LOG = []
+
+
+def engine_block():
+    """The engine's resolved hybrid attention block (what its boot line calls the
+    attention block size), from /metrics; None if it cannot be read. When the engine
+    was launched with an explicit --block-size (CTX=huge passes 128, KVarN's tile),
+    cache_config_info reports that value rather than the resolved hybrid block, so it
+    is not trusted: pass --block from the boot line instead."""
+    try:
+        argv = [x.decode(errors="replace")
+                for x in open(f"/proc/{_engine_pid()}/cmdline", "rb").read().split(b"\0")]
+        if any(x == "--block-size" or x.startswith("--block-size=") for x in argv):
+            return None
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        base = API[: -len("/v1")] if API.endswith("/v1") else API
+        req = urllib.request.Request(base + "/metrics",
+                                     headers={"Authorization": "Bearer " + KEY})
+        text = urllib.request.urlopen(req, timeout=30).read().decode()
+        m = re.search(r'^vllm:cache_config_info\{[^}]*\bblock_size="(\d+)"', text, re.M)
+        return int(m.group(1)) if m else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def healthy_floor(prev_prompt, block):
+    """Least cached_tokens a turn that reused the whole previous prefix can show."""
+    if not block:
+        return 0.9 * prev_prompt
+    return max(0, prev_prompt // block - 1) * block
 
 
 def call(messages, max_tokens=24):
@@ -78,11 +115,15 @@ FILLERS = {
 }
 
 
+RUN = f"{time.time_ns():x}"   # per-run salt: round 1 must be cold even if a previous run's prefix is cached
+
+
 def make_doc(side, n_chars):
     filler = FILLERS[side]
     body = filler * (n_chars // len(filler) + 1)
     lines = [body[i:i + 900] for i in range(0, n_chars, 900)]
-    return "\n".join(f"[{side}{i:05d}] {ln}" for i, ln in enumerate(lines))[:n_chars]
+    return f"[run {RUN}]\n" + "\n".join(
+        f"[{side}{i:05d}] {ln}" for i, ln in enumerate(lines))[:n_chars]
 
 
 def log(rec):
@@ -90,27 +131,61 @@ def log(rec):
     print(json.dumps(rec, ensure_ascii=False), flush=True)
 
 
+def _engine_pid():
+    """PID of the serving engine: HQ_UNIT's MainPID if set (user unit first, then
+    system), else the `vllm serve` process on this API's port, found from /proc.
+    This repo's launcher execs `vllm serve`, so the port is on its command line; the
+    port scan also works inside a container, where there is no unit."""
+    if UNIT:
+        for scope in (["--user"], []):
+            try:
+                pid = subprocess.check_output(
+                    ["systemctl", *scope, "show", UNIT, "-p", "MainPID", "--value"],
+                    text=True, timeout=10, stderr=subprocess.DEVNULL).strip()
+                if pid and pid != "0":
+                    return pid
+            except Exception:  # noqa: BLE001
+                pass
+    port = API.split("://", 1)[-1].split("/", 1)[0].rsplit(":", 1)[-1]
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            argv = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
+        except OSError:
+            continue
+        args = [x.decode(errors="replace") for x in argv]
+        if "serve" in args and any("vllm" in x for x in args[:3]) and \
+                any(x == "--port" and nxt == port for x, nxt in zip(args, args[1:])):
+            return pid
+    raise RuntimeError(f"no vllm serve on port {port} (set HQ_UNIT to name its unit)")
+
+
 def engine_env():
-    """Read the ENGINE process's environment, not this shell's.
+    """Read the ENGINE process's settings, not this shell's.
 
     Otherwise an arm label is whatever the caller happened to export, which is
-    how a run gets reported against the wrong arm. Returns the retention setting
-    and max_model_len, or placeholders if the unit cannot be read.
+    how a run gets reported against the wrong arm. The launcher computes both
+    values and passes them as flags, so the command line is read first and the
+    environment is only the fallback (the deprecated env spelling of the
+    retention interval). Returns placeholders if the engine cannot be read.
     """
     try:
-        pid = subprocess.check_output(
-            ["systemctl", "show", UNIT, "-p", "MainPID", "--value"],
-            text=True, timeout=10).strip()
+        pid = _engine_pid()
+        argv = [x.decode(errors="replace")
+                for x in open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")]
         raw = open(f"/proc/{pid}/environ", "rb").read().decode(errors="replace")
-        d = dict(x.split("=", 1) for x in raw.split("\0") if "=" in x)
-        extra = d.get("EXTRA_ARGS", "")
-        ret = "<unset>"
-        for tok, nxt in zip(extra.split(), extra.split()[1:]):
-            if tok == "--prefix-cache-retention-interval":
-                ret = nxt
-        if ret == "<unset>":
-            ret = d.get("VLLM_PREFIX_CACHE_RETENTION_INTERVAL", "<unset>")
-        return ret, d.get("MAX_LEN", "?")
+        env = dict(x.split("=", 1) for x in raw.split("\0") if "=" in x)
+
+        def flag(name):
+            for i, tok in enumerate(argv):
+                if tok == name and i + 1 < len(argv):
+                    return argv[i + 1]
+                if tok.startswith(name + "="):
+                    return tok.split("=", 1)[1]
+            return None
+
+        ret = flag("--prefix-cache-retention-interval") \
+            or env.get("VLLM_PREFIX_CACHE_RETENTION_INTERVAL") or "dense"
+        return ret, flag("--max-model-len") or env.get("MAX_LEN", "?")
     except Exception as exc:  # noqa: BLE001
         return f"<err:{exc}>", "?"
 
@@ -126,9 +201,14 @@ def main():
     ap.add_argument("--noise-tokens", type=int, default=4000)
     ap.add_argument("--budget-min", type=float, default=25.0)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--block", type=int, default=0,
+                    help="the engine's hybrid attention block, from its boot line "
+                         "('Setting attention block size to N tokens'); default: read "
+                         "from /metrics, which is only right without an explicit --block-size")
     args = ap.parse_args()
 
     retention, maxlen = engine_env()
+    block = args.block or engine_block()
     tag = f"RET{retention}_ML{maxlen}"
     t_start = time.time()
     deadline = t_start + args.budget_min * 60
@@ -136,6 +216,7 @@ def main():
         HERE, f"prefix-alternation-{tag}-{dt.datetime.now():%Y%m%d-%H%M%S}.json")
     print(f"══ alternating-conversation prefix reuse ══  engine: retention={retention} "
           f"MAX_LEN={maxlen}  (read from /proc/<engine>, not this shell)")
+    print(f"   engine attention block: {block if block else 'unreadable, falling back to 90% (pass --block <the boot line attention block size>)'}")
     print(f"   {args.target_tokens:,} tok/conversation  rounds={args.rounds}  "
           f"noise={args.noise}x{args.noise_tokens} tok  budget={args.budget_min:.0f} min")
     print(f"   output -> {out}\n")
@@ -172,7 +253,7 @@ def main():
                 stats["cold"] += 1
                 verdict = "COLD"
             else:
-                need = 0.9 * prev_prompt[side]
+                need = healthy_floor(prev_prompt[side], block)
                 if res["cached"] < need:
                     stats["lost"] += 1
                     verdict = "PREFIX-LOST"
