@@ -66,6 +66,13 @@ build by name instead of landing by guess. Regenerate a file with `bash scripts/
 | kvarn/kvarn-v2-runner-0.30.0 | own | KVarN with the V2 runner and DFlash2 (SW groups, Mamba block index, selector guards) | none | 0.30.0: re-cut from the main-track resolution, with its #54713 replay_boundaries fixup; #53007 rewrote _largest_kernel_block_within and the SW divisor rule is carried into it by hand | rides with KVarN |
 | kvarn/kvarn-recycled-pages-0.30.0 | own | both runners hand KVarN each step's block ids, so it drops (never flushes) what it still holds for a page another KV-cache group has taken: a late flush of a finished request's last block, or of an evicted retired sink, into another request's mamba state was the "!!!!" output (#208); the KVarN half is in `kvarn/files` | none | 0.30.0 | rides with KVarN |
 
+| mamba-align-eagle-drop | fix | `MambaManager.find_longest_cache_hit` takes `drop_eagle_block` and never reads it, so the state snapshot sitting on the generation point stays reachable and gets reused; `FullAttentionManager` refuses the equivalent position. A mamba block list is `[null, ..., state]` and cannot be trimmed after a match, so the search range stops one unit short instead: a hash block in the fine-grained branch, a cache block in the coarse branch. The coarse half is vllm #43650; the fine half is what that PR misses, because it lands below the early `return` in the fine-grained branch | vllm #43650 (open, coarse path only), vllm #53912 | written against 0.29.0 and applies to the 0.30.0 tree at `--fuzz 0` (both hunks, offset 53); not yet re-exported from a `qwen38/0.30` commit | the pin that carries #43650 |
+
+⚠️ `mamba-align-eagle-drop` was written and validated against a live 0.29.0 tree, not exported from a fork
+commit: `patch -p1 --fuzz 0` applies to the vanilla `v0.30.0` file (both hunks, offset 53) and to the
+installed post-series tree. Re-export it with `scripts/export-patch.sh` once it exists as a
+`[qwen38] mamba-align-eagle-drop` commit on `cpuchip/vllm qwen38/0.30`.
+
 Retired at 0.30.0 and removed from the tree: `offload-mtp-serve` (vllm #52771, #52807 and #54288, all in 0.30.0) and `mamba-align-retire-null-gaps` (vllm #55450, in 0.30.0).
 
 Retired at 0.29.0 and removed from the tree: `vllm-pr54282-draft-gumbel-salt` (vllm #54282, in 0.29.0),
