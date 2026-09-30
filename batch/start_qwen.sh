@@ -17,8 +17,8 @@
 #    checkpoint); VISION=1 keeps it for a client that sends images
 #  - expandable_segments is required: the DeltaNet prefill kernels allocate
 #    transient workspace and fragment the allocator, OOMs at util >= 0.978 without it
-#  - gpu-memory-utilization 0.972 is the sweet spot on a headless box
-#    (X/display holds ~220 MB; 0.98 fails the startup free-memory check)
+#  - gpu-memory-utilization 0.95 on vLLM 0.29 (0.972 on 0.28): see the KV=fp8
+#    branch below for why the default moved with the pin
 #  - max-num-batched-tokens 2048 beats 8192 here: bigger chunks inflate the
 #    profiled activation peak, which shrinks the KV/state page pool
 #  - kv-cache-dtype fp8 roughly doubles the usable context/pool
@@ -79,7 +79,16 @@ elif [ "$KV" = "kvarn" ]; then
   export KVARN_POOL_MEM_FRAC=${KVARN_POOL_MEM_FRAC:-0.25}
 else
   MAX_LEN=${MAX_LEN:-150000}
-  GPU_UTIL=${GPU_UTIL:-0.972}
+  # 0.95, not 0.28's 0.972. 0.29 with memory-profile-after-warmup and
+  # cudagraph-memory-from-allocator stops over-reserving ~1.5 GiB (KV 6.09 GiB at
+  # 0.972 on 0.28, 7.63 on 0.29, same box and settings), and at 0.972 that ~1.5 GiB
+  # was the headroom batch's unprofiled warmup transients lived in: 0.972 OOMs in
+  # warmup on 0.29 on a 3090, tower on or off (#182). Ladder on the reference 3090,
+  # boot plus 128 requests at 64-way concurrency: 0.93, 0.94, 0.95 and 0.96 all
+  # boot and serve with VISION=0 and 1, 0.972 does not. 0.95 keeps one 0.01 step
+  # below the highest value that passed, boots cold to the same pool as warm
+  # (219,587 tokens with the tower), and holds at least the pool 0.28 had at 0.972.
+  GPU_UTIL=${GPU_UTIL:-0.95}
   KV_ARGS="--kv-cache-dtype fp8"
 fi
 # int8 activations: "int8" (default) or empty for W4A16; layers: regex on the
@@ -188,6 +197,26 @@ case " ${EXTRA_ARGS:-} " in
   *"--kv-offloading-size"*|*"--kv-transfer-config"*)
     [ -z "${PYTORCH_CUDA_ALLOC_CONF:-}" ] && [ "$ALLOC_DEFAULT" = expandable_segments:True ] && echo "KV connector in EXTRA_ARGS: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False (vLLM rejects the connector under VMM; set it explicitly to override)"
     ALLOC_DEFAULT=expandable_segments:False ;;
+esac
+# vLLM's custom all-reduce exports its graph buffers over CUDA IPC
+# (`cudaIpcGetMemHandle`, csrc/custom_all_reduce.cuh:164) and an expandable
+# (VMM) segment has no handle to export, so at TP>1 with CUDA graphs capture
+# aborts with "Cuda error ... 'invalid argument'" and the worker dies before
+# the server is up (#163, 2x3090 NVLink). --disable-custom-all-reduce also
+# clears it by handing the collectives to NCCL, but that arm measured 6.4%
+# slower at C1 on the reporting box, so default the allocator off and keep
+# custom all-reduce. Skipped when the run already disables it or runs eager:
+# neither captures a graph buffer to export.
+case " ${EXTRA_ARGS:-} " in
+  *"--disable-custom-all-reduce"*|*"--enforce-eager"*) ;;
+  *"--tensor-parallel-size"*|*" -tp "*)
+    ALLOC_TP=$(printf %s " ${EXTRA_ARGS:-}" | sed -En "s/.* (--tensor-parallel-size[= ]|-tp )([0-9]+).*/\2/p")
+    if [ "${ALLOC_TP:-1}" -gt 1 ] 2>/dev/null; then
+      if [ -z "${PYTORCH_CUDA_ALLOC_CONF:-}" ] && [ "$ALLOC_DEFAULT" = expandable_segments:True ]; then
+        echo "tensor-parallel-size $ALLOC_TP: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False (custom all-reduce cannot export a VMM graph buffer over CUDA IPC, #163; set it explicitly to override)"
+      fi
+      ALLOC_DEFAULT=expandable_segments:False
+    fi ;;
 esac
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-$ALLOC_DEFAULT}
 # flashinfer's sampling.cu does not build with older system nvcc (12.0);

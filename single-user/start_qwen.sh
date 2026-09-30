@@ -501,6 +501,43 @@ if [ "${PREFIX_CACHE:-0}" = "1" ]; then
   # KVarN runs --block-size 128; match the prefix hash unit to its tile so cache
   # hits land on tile boundaries (a non-multiple of 128 corrupts the pool).
   [ "$CTX" = "huge" ] && EXTRA_ARGS="--prefix-match-unit 128 ${EXTRA_ARGS}"
+  # CTX=huge + DFlash2: retain one Mamba state snapshot in six rather than one per
+  # block (#174). vLLM's default is dense, and at dense the snapshots of two long
+  # conversations advanced in turn do not fit beside each other: on the reference
+  # 3090 two ~32.6K chats alternating reused 0% and re-prefilled for 31.8 s on every
+  # turn; with one in six they reuse 93-99.5% at 0.4-2.6 s (0.28). On 0.29 the first
+  # reuse after a cold turn lands on the last retained snapshot, not the last block: at
+  # 32.6K a side it was 80.0% (26,112 = 2 x 13056) at 7.0 s, then 99.3-99.4% at ~0.5 s
+  # from the next turn on, against 0% and ~29 s per turn dense. One ~103K chat on its own
+  # keeps 98.7-99.8%, and a passcode inside the reused prefix comes back right 3/3,
+  # so the sparser restore path returns the right state.
+  # The interval is in tokens and vLLM refuses one that is not a multiple of the
+  # attention block, and that block moves with the draft count (the Mamba page holds
+  # the speculative state slots): 2176 at 7 drafts, 2432 at 15, both measured. Other
+  # draft counts stay dense and say how to set it by hand. PREFIX_RETENTION= (empty)
+  # forces dense; --prefix-cache-retention-interval in EXTRA_ARGS always wins, then an
+  # exported VLLM_PREFIX_CACHE_RETENTION_INTERVAL.
+  # On 0.29 the interval has to go in as the flag. `vllm serve` still reads the
+  # deprecated env var (and logs the deprecation), but the flag's own unset default
+  # overrides it, so hybrid + EAGLE falls back to dense with no error: an exported
+  # 13057, which the flag refuses, boots. An exported value is carried over as the flag.
+  if [ "$CTX" = "huge" ] && [ "$SPEC" = "dflash2" ]; then
+    case " ${EXTRA_ARGS:-} " in
+      *"--prefix-cache-retention-interval"*) ;;
+      *)
+        case $DRAFT_TOKENS in 7) RETENTION=13056 ;; 15) RETENTION=14592 ;; *) RETENTION= ;; esac
+        RETENTION=${VLLM_PREFIX_CACHE_RETENTION_INTERVAL-${PREFIX_RETENTION-$RETENTION}}
+        if [ -n "$RETENTION" ]; then
+          EXTRA_ARGS="--prefix-cache-retention-interval $RETENTION ${EXTRA_ARGS}"
+        elif [ -z "${PREFIX_RETENTION+x}" ] && [ -z "${VLLM_PREFIX_CACHE_RETENTION_INTERVAL+x}" ]; then
+          echo "[start_qwen] CTX=huge DFLASH_TOKENS=$DRAFT_TOKENS: no measured block size, so" \
+               "prefix retention stays dense and two long conversations advanced in turn will" \
+               "evict each other (#174). Set PREFIX_RETENTION to 6x the 'attention block size'" \
+               "line this boot prints." >&2
+        fi ;;
+    esac
+    unset VLLM_PREFIX_CACHE_RETENTION_INTERVAL
+  fi
   # DFlash2 only: prefix caching and a CAPTURED (FULL) verify step do not mix on
   # that path. It is the capture, not the drafter: eager is clean, and so is
   # PIECEWISE, which keeps the compiled graphs and leaves only the multi-query
@@ -722,6 +759,26 @@ case " ${EXTRA_ARGS:-} " in
   *"--kv-offloading-size"*|*"--kv-transfer-config"*)
     [ -z "${PYTORCH_CUDA_ALLOC_CONF:-}" ] && [ "$ALLOC_DEFAULT" = expandable_segments:True ] && echo "KV connector in EXTRA_ARGS: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False (vLLM rejects the connector under VMM; set it explicitly to override)"
     ALLOC_DEFAULT=expandable_segments:False ;;
+esac
+# vLLM's custom all-reduce exports its graph buffers over CUDA IPC
+# (`cudaIpcGetMemHandle`, csrc/custom_all_reduce.cuh:164) and an expandable
+# (VMM) segment has no handle to export, so at TP>1 with CUDA graphs capture
+# aborts with "Cuda error ... 'invalid argument'" and the worker dies before
+# the server is up (#163, 2x3090 NVLink). --disable-custom-all-reduce also
+# clears it by handing the collectives to NCCL, but that arm measured 6.4%
+# slower at C1 on the reporting box, so default the allocator off and keep
+# custom all-reduce. Skipped when the run already disables it or runs eager:
+# neither captures a graph buffer to export.
+case " ${EXTRA_ARGS:-} " in
+  *"--disable-custom-all-reduce"*|*"--enforce-eager"*) ;;
+  *"--tensor-parallel-size"*|*" -tp "*)
+    ALLOC_TP=$(printf %s " ${EXTRA_ARGS:-}" | sed -En "s/.* (--tensor-parallel-size[= ]|-tp )([0-9]+).*/\2/p")
+    if [ "${ALLOC_TP:-1}" -gt 1 ] 2>/dev/null; then
+      if [ -z "${PYTORCH_CUDA_ALLOC_CONF:-}" ] && [ "$ALLOC_DEFAULT" = expandable_segments:True ]; then
+        echo "tensor-parallel-size $ALLOC_TP: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False (custom all-reduce cannot export a VMM graph buffer over CUDA IPC, #163; set it explicitly to override)"
+      fi
+      ALLOC_DEFAULT=expandable_segments:False
+    fi ;;
 esac
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-$ALLOC_DEFAULT}
 export VLLM_USE_FLASHINFER_SAMPLER=0
