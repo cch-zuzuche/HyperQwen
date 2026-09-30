@@ -64,14 +64,7 @@ build by name instead of landing by guess. Regenerate a file with `bash scripts/
 | vllm-pr50021-gdn-spec-bounds | backport | bounds checks in GDN/KDA spec-decode state lookups | vllm #50021 (open) | 0.29.0 | the pin that carries #50021 |
 | kvarn/kvarn-0.29.0 | feature | KVarN cache dtypes, quant mode, backend registration, page size | none (KVarN is Huawei CSL's, Apache-2.0) | 0.29.0; attn_utils view hunk retired | upstreamed |
 | kvarn/kvarn-v2-runner-0.29.0 | own | KVarN with the V2 runner and DFlash2 (SW groups, Mamba block index, selector guards) | none | 0.29.0; kv_cache_utils hunks retired | rides with KVarN |
-| mamba-align-eagle-drop | fix | `MambaManager` never honoured `drop_eagle_block`: the state snapshot sitting on the generation point stays reachable and is reused, corrupting a fraction of long-prefix responses (`!` wall, 0.000 spec-decode acceptance). Fine-grained half added below #43650's early `return` | vllm #43650 (open, coarse path only), #53912 | 0.29.0; fine half not covered by #43650 | the pin that carries #43650 |
 
-⚠️ **`mamba-align-eagle-drop` is not yet exported from a fork commit.** It was written and validated
-against the installed 0.29.0 tree (`patch -p1 --fuzz 0` applies cleanly and reproduces that tree
-byte-for-byte), but this file only becomes the source of truth once the change exists as a
-`[qwen38] mamba-align-eagle-drop` commit on `cpuchip/vllm` and is regenerated with
-`bash scripts/export-patch.sh <fork checkout> <commit> patches/mamba-align-eagle-drop.patch`.
-Until then, do not hand-edit it further.
 
 | kvarn/kvarn-recycled-pages-0.29.0 | fix | KVarN flushes a finished request's last full block to int4 in the first build after it leaves the batch, and evicts retired sinks when the pool runs dry. Every KV-cache group on this model shares one tensor per layer position, so the page can belong to another group by then — and both runners write mamba state before attention metadata, so the tile write lands on live state, which reads back as NaN and the request prints token 0, `!`, from then on (#208). The runner now hands KVarN the step's scheduled block ids and the builder drops, without flushing, whatever its pool still holds for a foreign page. KVarN half in `kvarn/files`, runner half in the patch | vllm: none (a KVarN/port defect); upstream project #208 | 0.29.0; adapted by hand from the 0.30.0 fix, which has two runner hooks because it has the split V2 runner and this pin does not | rides with KVarN |
 
@@ -85,6 +78,17 @@ observable for us nor changes behaviour here. The `chunk_o.py` half is a separat
 copy dropped the mask that upstream `fla-org/flash-linear-attention` applies before `exp2`, reported
 upstream as vllm#59404 with that scope stated honestly (divergence + structural argument, no reproducer).
 Kept in the tree because it is harmless; do not cite it as a fix.
+
+
+❌ **`mamba-align-eagle-drop` was withdrawn on 2026-09-30** (PR syv-ai/HyperQwen#245). It is not in
+`patches/` any more and must not be re-added. A review (TyroneNel) showed that the mamba hit is already
+capped one drop unit below the generation point by the coordinator's "No margin for mamba" rule plus
+`FullAttentionManager`'s own `hit_length -= min(alignment_tokens, block_size)`, so the extra search-range
+cut removed *correct* hits: on this repo's post-series tree the upstream v0.30 mamba/EAGLE/hybrid
+prefix-cache tests go from 93 passed to 84 passed / 9 failed with it, and the local replay measured up to
+-8,320 tokens of reuse (and 0 hits in the cases the tests cover). The `![mamba-hit-probe]` line that
+motivated it (`hit == max_length`, not longer) was read backwards. The `!`-wall this was meant to fix has
+a better-supported cause: `kvarn/kvarn-recycled-pages-0.29.0` (#208).
 
 Retired at 0.29.0 and removed from the tree: `vllm-pr54282-draft-gumbel-salt` (vllm #54282, in 0.29.0),
 `xgrammar-spec-terminated` (in 0.29.0), and `sse-keep-alive` (vllm 585bb07c7, in 0.29.0 and not in
