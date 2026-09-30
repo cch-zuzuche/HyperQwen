@@ -75,6 +75,17 @@ Until then, do not hand-edit it further.
 
 | kvarn/kvarn-recycled-pages-0.29.0 | fix | KVarN flushes a finished request's last full block to int4 in the first build after it leaves the batch, and evicts retired sinks when the pool runs dry. Every KV-cache group on this model shares one tensor per layer position, so the page can belong to another group by then — and both runners write mamba state before attention metadata, so the tile write lands on live state, which reads back as NaN and the request prints token 0, `!`, from then on (#208). The runner now hands KVarN the step's scheduled block ids and the builder drops, without flushing, whatever its pool still holds for a foreign page. KVarN half in `kvarn/files`, runner half in the patch | vllm: none (a KVarN/port defect); upstream project #208 | 0.29.0; adapted by hand from the 0.30.0 fix, which has two runner hooks because it has the split V2 runner and this pin does not | rides with KVarN |
 
+
+⚠️ **`mamba-chunked-prefill-align`: the `mamba_utils.py` half is a verified no-op on this tree** (checked
+2026-09-30). It stored `src_col = state_idx` and we changed it to `-1` for `num_computed == 0 |
+state_idx < 0 | state_idx == new_state_idx`, but `precopy_mamba_align_fused_kernel` already returns
+early on exactly those cases (`if src_col < 0 or src_col == dst_col: return`), and `add_request` seeds a
+fresh request's column to `(num_computed_tokens - 1) // mamba_bs` = `-1`. So it neither fixed anything
+observable for us nor changes behaviour here. The `chunk_o.py` half is a separate matter: the vendored
+copy dropped the mask that upstream `fla-org/flash-linear-attention` applies before `exp2`, reported
+upstream as vllm#59404 with that scope stated honestly (divergence + structural argument, no reproducer).
+Kept in the tree because it is harmless; do not cite it as a fix.
+
 Retired at 0.29.0 and removed from the tree: `vllm-pr54282-draft-gumbel-salt` (vllm #54282, in 0.29.0),
 `xgrammar-spec-terminated` (in 0.29.0), and `sse-keep-alive` (vllm 585bb07c7, in 0.29.0 and not in
 0.28.0; the `--sse-keep-alive-interval` flag is unchanged, so nothing that sets it needs to change).
