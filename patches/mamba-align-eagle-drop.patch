@@ -1,0 +1,81 @@
+Mamba "align" prefix caching: honour `drop_eagle_block` so the state snapshot on
+the generation point is not handed back (upstream vllm#53912, #43650).
+
+`MambaManager.find_longest_cache_hit` takes `drop_eagle_block` and never reads
+it. `FullAttentionManager` uses it to hand back one drop unit LESS than the
+generation point (`hit_length -= min(alignment_tokens, block_size)`); the mamba
+finder returns its longest match regardless. The hybrid coordinator reconciles
+per-group hits by taking the minimum, so a mamba group that matches further than
+the attention groups keeps the resume position, and the request resumes from a
+mamba state block that sits on a boundary EAGLE requires be recomputed.
+
+A mamba state block is `[null, ..., state]` and cannot be trimmed after a match
+the way append-only attention KV can, so the search range has to stop one unit
+short instead. The unit is the one the finder searches in: a hash block in the
+fine-grained branch, a cache block in the coarse branch. The coarse half is
+upstream #43650 verbatim. The fine half is what that PR misses: the patch lands
+below the `return` in the fine-grained branch, so any deployment using
+`--prefix-match-unit` below the mamba page size never reaches it (reported on
+#53912).
+
+This config takes the fine branch: `block_size` 2176 (the platform raises the
+attention block to the mamba page) with `--prefix-match-unit 128`, so
+`alignment_tokens` is 128 and `MambaManager` returns early from the fine path.
+
+Why it matters here. The mamba finder registers a "partial tail" state block at
+the prompt's last hash boundary (`_cache_partial_tail_block`), which is by
+construction the generation point. On the DFlash2/hybrid-GDN target a reused
+prefix that ends there produces a silent, low-rate corruption: one stray token
+followed by a wall of `!` until the token budget runs out, with spec-decode
+acceptance pinned at exactly 0.000 (against 50-80% healthy). Upstream #53912
+reports the same "run of repeated `!` characters" at 0.8-0.95% of responses,
+scaling with prefix-cache hit rate; #55357 has the same 0.000-acceptance
+fingerprint.
+
+Evidence (this box, `[mamba-hit-probe]` on the live tree, CTX=huge):
+
+    block_size=2176 align=128 max_length=86656 max_units=677 drop_eagle=True
+      fine_idx=676 hit=86656 blk_aligned=False
+
+— a fine-grained snapshot inside the last block, on the generation point, being
+handed back to a request that then resumed there.
+
+Cost. The resumed prefix is one unit shorter, so one unit is recomputed. With
+dense checkpoints that is one mamba block (2176 tokens); with sparse retention
+(`--prefix-cache-retention-interval 13056`) the next older retained snapshot can
+be up to one segment back, so the tail loss is larger. Measured over the
+session replay (turns 7-8, six steps): 86,656 -> 78,336 on the worst step
+(-8,320, i.e. 9.5% of an 87k prompt, one retained segment) and -256 on another;
+the other four steps unchanged.
+
+Retires when the pin carries #43650 (and, for the fine-grained half, whatever
+lands on #53912).
+--- a/v1/core/single_type_kv_cache_manager.py
++++ b/v1/core/single_type_kv_cache_manager.py
+@@ -1469,6 +1469,15 @@
+             max_num_partial_units = min(
+                 max_length // hash_block_size, len(block_hashes)
+             )
++            if drop_eagle_block and max_num_partial_units > 0:
++                # EAGLE/MTP never walks backwards over the generation point,
++                # so the state snapshot sitting on it must not be handed back.
++                # A mamba state block is [null, ..., state] and cannot be
++                # trimmed after a match the way append-only attention KV can,
++                # so the search range itself has to stop one unit short.
++                # The fine-grained unit is one hash block (the coarse path
++                # below stops one cache block short instead).
++                max_num_partial_units -= 1
+             for fine_idx in range(max_num_partial_units - 1, -1, -1):
+                 num_tokens = (fine_idx + 1) * hash_block_size
+                 block_hash = block_hashes[fine_idx]
+@@ -1484,6 +1493,10 @@
+             return computed_blocks, hit_length
+ 
+         max_num_blocks = max_length // block_size
++        if drop_eagle_block and max_num_blocks > 0:
++            # Same reason as the fine-grained path above, with a whole cache
++            # block as the unit.
++            max_num_blocks -= 1
+         # Search from right to left and early stop when a match is found.
+         for i in range(max_num_blocks - 1, -1, -1):
+             if cached_block := block_pool.get_cached_block(

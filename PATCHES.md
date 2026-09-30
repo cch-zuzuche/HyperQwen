@@ -59,6 +59,14 @@ build by name instead of landing by guess. Regenerate a file with `bash scripts/
 | vllm-pr50021-gdn-spec-bounds | backport | bounds checks in GDN/KDA spec-decode state lookups | vllm #50021 (open) | 0.29.0 | the pin that carries #50021 |
 | kvarn/kvarn-0.29.0 | feature | KVarN cache dtypes, quant mode, backend registration, page size | none (KVarN is Huawei CSL's, Apache-2.0) | 0.29.0; attn_utils view hunk retired | upstreamed |
 | kvarn/kvarn-v2-runner-0.29.0 | own | KVarN with the V2 runner and DFlash2 (SW groups, Mamba block index, selector guards) | none | 0.29.0; kv_cache_utils hunks retired | rides with KVarN |
+| mamba-align-eagle-drop | fix | `MambaManager` never honoured `drop_eagle_block`: the state snapshot sitting on the generation point stays reachable and is reused, corrupting a fraction of long-prefix responses (`!` wall, 0.000 spec-decode acceptance). Fine-grained half added below #43650's early `return` | vllm #43650 (open, coarse path only), #53912 | 0.29.0; fine half not covered by #43650 | the pin that carries #43650 |
+
+⚠️ **`mamba-align-eagle-drop` is not yet exported from a fork commit.** It was written and validated
+against the installed 0.29.0 tree (`patch -p1 --fuzz 0` applies cleanly and reproduces that tree
+byte-for-byte), but this file only becomes the source of truth once the change exists as a
+`[qwen38] mamba-align-eagle-drop` commit on `cpuchip/vllm` and is regenerated with
+`bash scripts/export-patch.sh <fork checkout> <commit> patches/mamba-align-eagle-drop.patch`.
+Until then, do not hand-edit it further.
 
 Retired at 0.29.0 and removed from the tree: `vllm-pr54282-draft-gumbel-salt` (vllm #54282, in 0.29.0),
 `xgrammar-spec-terminated` (in 0.29.0), and `sse-keep-alive` (vllm 585bb07c7, in 0.29.0 and not in
