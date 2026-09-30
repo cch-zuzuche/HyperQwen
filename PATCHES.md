@@ -68,6 +68,8 @@ byte-for-byte), but this file only becomes the source of truth once the change e
 `bash scripts/export-patch.sh <fork checkout> <commit> patches/mamba-align-eagle-drop.patch`.
 Until then, do not hand-edit it further.
 
+| kvarn/kvarn-recycled-pages-0.29.0 | fix | KVarN flushes a finished request's last full block to int4 in the first build after it leaves the batch, and evicts retired sinks when the pool runs dry. Every KV-cache group on this model shares one tensor per layer position, so the page can belong to another group by then — and both runners write mamba state before attention metadata, so the tile write lands on live state, which reads back as NaN and the request prints token 0, `!`, from then on (#208). The runner now hands KVarN the step's scheduled block ids and the builder drops, without flushing, whatever its pool still holds for a foreign page. KVarN half in `kvarn/files`, runner half in the patch | vllm: none (a KVarN/port defect); upstream project #208 | 0.29.0; adapted by hand from the 0.30.0 fix, which has two runner hooks because it has the split V2 runner and this pin does not | rides with KVarN |
+
 Retired at 0.29.0 and removed from the tree: `vllm-pr54282-draft-gumbel-salt` (vllm #54282, in 0.29.0),
 `xgrammar-spec-terminated` (in 0.29.0), and `sse-keep-alive` (vllm 585bb07c7, in 0.29.0 and not in
 0.28.0; the `--sse-keep-alive-interval` flag is unchanged, so nothing that sets it needs to change).
